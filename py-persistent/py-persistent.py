@@ -3,28 +3,58 @@ import time
 import random
 
 import functools
-import json
-import os
 import atexit
 
-def load_cache_with_hash(json_file):
-    # Load the cache from the JSON file if it exists
-    if os.path.exists(json_file):
-        with open(json_file, 'r') as f:
-            try:
-                cache = json.load(f)
-            except json.JSONDecodeError:
-                cache = {}
-    else:
-        cache = {}
 
+import sqlite3
+
+DATABASE_NAME = "function.db"
+
+def initialize_db():
+    """Initialize the SQLite database connection."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    return conn
+
+def create_table_if_not_exists(conn, func_name):
+    """Create a table for the function if it does not already exist."""
+    with conn:
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {func_name} (
+                hash_key TEXT PRIMARY KEY,
+                result BLOB
+            )
+        """)
+
+def load_cache_with_hash(func_name):
+    """Load the cache from the SQLite database into a dictionary."""
+    conn = initialize_db()
+    create_table_if_not_exists(conn, func_name)
+    
+    cache = {}
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT hash_key, result FROM {func_name}")
+    rows = cursor.fetchall()
+    
+    for row in rows:
+        cache[row[0]] = row[1]
+    
+    conn.close()
+    print(f"Cache loaded: {cache}")
     return cache
 
-
-def save_cache_with_hash(func, json_file):
-    # Manually save the cache to the JSON file if needed
-    with open(json_file, 'w') as f:
-        json.dump(func.cache, f)
+def save_cache_with_hash(func, func_name):
+    """Save the function cache to the SQLite database."""
+    conn = initialize_db()
+    create_table_if_not_exists(conn, func_name)
+    
+    with conn:
+        for hash_key, result in func.cache.items():
+            conn.execute(f"""
+                INSERT OR REPLACE INTO {func_name} (hash_key, result)
+                VALUES (?, ?)
+            """, (hash_key, result))
+    
+    conn.close()
 
 
 def cache_with_hash(dictionary_json):
@@ -53,12 +83,12 @@ def cache_with_hash(dictionary_json):
     return decorator
 
 # Example usage
-@cache_with_hash("add.json")
-def add(x, y):
+@cache_with_hash("add_custom")
+def add_custom(x, y):
     return x + y
 
-@cache_with_hash("multiply.json")
-def multiply(x, y):
+@cache_with_hash("multiply_custom")
+def multiply_custom(x, y):
     time.sleep(1)
     return x * y
 
@@ -67,10 +97,10 @@ def test_main():
     for _ in range(100):
         a = random.randint(1, 5)
         b = random.randint(1, 5)
-        result = multiply(a, b)
+        result = multiply_custom(a, b)
 
     # Manually save the cache if needed
-    save_cache_with_hash(multiply, "multiply.json")
+    save_cache_with_hash(multiply_custom, "multiply_custom")
 
 
 if __name__ == "__main__":
