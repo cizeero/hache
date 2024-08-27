@@ -2,16 +2,33 @@ import hashlib
 import inspect
 import numpy as np
 import io
-import time
 import random
 
 import functools
 import atexit
 
-
 import sqlite3
+import collections
 
 DATABASE_NAME = "function.db"
+
+
+def to_blob(result, blob_type):
+    if blob_type == int:
+        return result
+    if blob_type == np.ndarray:
+        with io.BytesIO() as output:
+            np.save(output, result)
+            return output.getvalue()
+
+def from_blob(blob, blob_type):
+    if blob_type == int:
+        return blob
+    if blob_type == np.ndarray:
+        with io.BytesIO(blob) as input_bytes:
+            return np.load(input_bytes)
+
+
 
 def initialize_db():
     """Initialize the SQLite database connection."""
@@ -62,29 +79,12 @@ def function_setup(conn, func):
                 conn.execute("UPDATE Hashes SET descriptionHash = ? WHERE function = ?",
                              (current_hash, func.__name__))
 
-def to_blob(result, blob_type):
-    if blob_type == int:
-        return result
-    if blob_type == np.ndarray:
-        with io.BytesIO() as output:
-            np.save(output, result)
-            return output.getvalue()
-
-def from_blob(blob, blob_type):
-    if blob_type == int:
-        return blob
-    if blob_type == np.ndarray:
-        with io.BytesIO(blob) as input_bytes:
-            return np.load(input_bytes)
-
-
-
 def load_cache_with_hash(func, blob_type):
     """Load the cache from the SQLite database into a dictionary."""
     conn = initialize_db()
     function_setup(conn, func)
     
-    cache = {}
+    cache = collections.OrderedDict()
     cursor = conn.cursor()
     cursor.execute(f"SELECT hashKey, result FROM {func.__name__}")
     rows = cursor.fetchall()
@@ -110,7 +110,7 @@ def save_cache_with_hash(func, blob_type):
     conn.close()
 
 
-def cache_with_hash(blob_type):
+def cache_with_hash(blob_type, max_size):
     def decorator(func):
         cache = load_cache_with_hash(func, blob_type)
 
@@ -120,10 +120,16 @@ def cache_with_hash(blob_type):
             hash_key = hashlib.md5(hash_input.encode()).hexdigest()
             
             if hash_key in cache:
+                cache.move_to_end(hash_key)
                 return cache[hash_key]
             
             # Cache missing, calculate and update
             result = func(*args, **kwargs)
+
+            if len(cache) >= max_size:
+                # Remove the least recently used item (first item)
+                cache.popitem(last=False)
+
             cache[hash_key] = result
             return result
 
@@ -135,12 +141,11 @@ def cache_with_hash(blob_type):
         return wrapper
     return decorator
 
-# Example usage
-@cache_with_hash(int)
+@cache_with_hash(int, 1000)
 def add_custom(x, y):
     return x + y
 
-@cache_with_hash(int)
+@cache_with_hash(int, 1000)
 def multiply_custom(x, y):
     time.sleep(1)
     return x * y
@@ -155,7 +160,7 @@ def test_multiply():
     # Manually save the cache if needed
     save_cache_with_hash(multiply_custom, np.ndarray)
 
-@cache_with_hash(np.ndarray)
+@cache_with_hash(np.ndarray, 1000)
 def multiply_matrix(a, b):
     return a @ b
 
@@ -173,8 +178,31 @@ def test_matrix():
     save_cache_with_hash(multiply_matrix, np.ndarray)
 
 
+@cache_with_hash(int, 2)
+def add_lru_test(x, y):
+    return x + y
+
+def test_lru():
+    add_lru_test(1, 2)
+    # cache hit 1
+    add_lru_test(1, 2)
+    print("^^cache must hit")
+    add_lru_test(2, 3)
+    print("^^no cache hit")
+    add_lru_test(3, 4)
+    print("^^no cache hit")
+    add_lru_test(1, 2)
+    print("^^no cache hit")
+    add_lru_test(1, 2)
+    print("^^cache must hit")
+
+    add_lru_test(4, 3)
+    add_lru_test(6, 4)
+
+
+
 def test_main():
-    test_matrix()
+    test_lru()
 
 if __name__ == "__main__":
     test_main()
