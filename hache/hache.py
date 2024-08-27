@@ -2,36 +2,46 @@ import hashlib
 import inspect
 import numpy as np
 import io
-import random
-
 import functools
 import atexit
-
 import sqlite3
 import collections
 
 DATABASE_NAME = "function.db"
+"""
+# Hache: Persistent Cache Manager
+
+Hache is a one-file library that allows you to have persistent cacheing for
+function return values. We map the hash (`md5`) of the input parameters
+in-order to the output value. In order to avoid bugs, any change in the
+function description or the docstring will clear the function cache and start
+afresh.
+"""
 
 
+"""
+BLOB conversion: The function outputs are stored in terms of BLOBs, the library
+currently treats numpy array as a special case and dumps the arrays in binary.
+"""
 def to_blob(result, blob_type):
-    if blob_type == int:
-        return result
     if blob_type == np.ndarray:
         with io.BytesIO() as output:
             np.save(output, result)
             return output.getvalue()
+    else:
+        return result
 
 def from_blob(blob, blob_type):
-    if blob_type == int:
-        return blob
     if blob_type == np.ndarray:
         with io.BytesIO(blob) as input_bytes:
             return np.load(input_bytes)
+    else:
+        return blob
 
 
 
 def initialize_db():
-    """Initialize the SQLite database connection."""
+    """Initialize the SQLite database connection, the entire DB is one file."""
     conn = sqlite3.connect(DATABASE_NAME)
 
     with conn:
@@ -44,7 +54,12 @@ def initialize_db():
     return conn
 
 def function_setup(conn, func):
-    """Set up the function table based on its current hash."""
+    """Set up the function table based on its current hash.
+    
+    The library supports the change of the function description. If there is a
+    change then the old entries are deleted, we track these changes by storing
+    a table of function name to code description hash.
+    """
     
     source_plus_desc = inspect.getsource(func) 
     desc = inspect.getdoc(func)
@@ -58,6 +73,7 @@ def function_setup(conn, func):
         result = cursor.fetchone()
 
         if result is None:
+            # New function addition, no previous hash entry found
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {func.__name__} (
                     hashKey TEXT PRIMARY KEY,
@@ -69,6 +85,7 @@ def function_setup(conn, func):
         else:
             stored_hash = result[0]
             if stored_hash != current_hash:
+                # Function code has been modified, clear entries
                 conn.execute(f"DROP TABLE IF EXISTS {func.__name__}")
                 conn.execute(f"""
                     CREATE TABLE {func.__name__} (
@@ -84,11 +101,11 @@ def load_cache_with_hash(func, blob_type):
     conn = initialize_db()
     function_setup(conn, func)
     
-    cache = collections.OrderedDict()
     cursor = conn.cursor()
     cursor.execute(f"SELECT hashKey, result FROM {func.__name__}")
     rows = cursor.fetchall()
     
+    cache = collections.OrderedDict()
     for row in rows:
         cache[row[0]] = from_blob(row[1], blob_type)
     
@@ -109,8 +126,17 @@ def save_cache_with_hash(func, blob_type):
     
     conn.close()
 
+"""
+A decorator function that can be applied to any function to make a persistent
+cache. By default we use LRU caching mechanism to manage memory. This naturally
+demands a maximum size of the cache.
 
-def cache_with_hash(blob_type, max_size):
+Note that each runtime will start with a cache load from the persistent storage
+and ends with the current cache being moved to the persistent storage. All the
+entries from the persistent storage will load with the same recency. LRU does
+not carry over from one runtime to the other.
+"""
+def hache(blob_type, max_size):
     def decorator(func):
         cache = load_cache_with_hash(func, blob_type)
 
@@ -141,13 +167,23 @@ def cache_with_hash(blob_type, max_size):
         return wrapper
     return decorator
 
-@cache_with_hash(int, 1000)
+
+"""
+###############################################################################
+Below code is not part of the functionality but was made just for testing. Add
+print statements in the above functionality for checking if the behaviour is as
+expected.
+###############################################################################
+"""
+
+import random
+
+@hache(int, 1000)
 def add_custom(x, y):
     return x + y
 
-@cache_with_hash(int, 1000)
+@hache(int, 1000)
 def multiply_custom(x, y):
-    time.sleep(1)
     return x * y
 
 
@@ -156,11 +192,12 @@ def test_multiply():
         a = random.randint(1, 5)
         b = random.randint(1, 5)
         result = multiply_custom(a, b)
+        assert result == a * b
 
     # Manually save the cache if needed
     save_cache_with_hash(multiply_custom, np.ndarray)
 
-@cache_with_hash(np.ndarray, 1000)
+@hache(np.ndarray, 1000)
 def multiply_matrix(a, b):
     return a @ b
 
@@ -178,7 +215,7 @@ def test_matrix():
     save_cache_with_hash(multiply_matrix, np.ndarray)
 
 
-@cache_with_hash(int, 2)
+@hache(int, 2)
 def add_lru_test(x, y):
     return x + y
 
@@ -202,6 +239,7 @@ def test_lru():
 
 
 def test_main():
+    test_matrix()
     test_lru()
 
 if __name__ == "__main__":
