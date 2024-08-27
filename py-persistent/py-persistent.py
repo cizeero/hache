@@ -1,4 +1,7 @@
 import hashlib
+import inspect
+import numpy as np
+import io
 import time
 import random
 
@@ -13,53 +16,103 @@ DATABASE_NAME = "function.db"
 def initialize_db():
     """Initialize the SQLite database connection."""
     conn = sqlite3.connect(DATABASE_NAME)
-    return conn
 
-def create_table_if_not_exists(conn, func_name):
-    """Create a table for the function if it does not already exist."""
     with conn:
         conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {func_name} (
-                hash_key TEXT PRIMARY KEY,
-                result BLOB
+            CREATE TABLE IF NOT EXISTS Hashes (
+                function TEXT PRIMARY KEY,
+                descriptionHash TEXT
             )
         """)
+    return conn
 
-def load_cache_with_hash(func_name):
+def function_setup(conn, func):
+    """Set up the function table based on its current hash."""
+    
+    source_plus_desc = inspect.getsource(func) 
+    desc = inspect.getdoc(func)
+    if desc is not None:
+        source_plus_desc += desc
+        
+    current_hash = hashlib.md5(source_plus_desc.encode()).hexdigest()
+
+    with conn:
+        cursor = conn.execute("SELECT descriptionHash FROM Hashes WHERE function = ?", (func.__name__,))
+        result = cursor.fetchone()
+
+        if result is None:
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {func.__name__} (
+                    hashKey TEXT PRIMARY KEY,
+                    result BLOB
+                )
+            """)
+            conn.execute("INSERT INTO Hashes (function, descriptionHash) VALUES (?, ?)",
+                         (func.__name__, current_hash))
+        else:
+            stored_hash = result[0]
+            if stored_hash != current_hash:
+                conn.execute(f"DROP TABLE IF EXISTS {func.__name__}")
+                conn.execute(f"""
+                    CREATE TABLE {func.__name__} (
+                        hashKey TEXT PRIMARY KEY,
+                        result BLOB
+                    )
+                """)
+                conn.execute("UPDATE Hashes SET descriptionHash = ? WHERE function = ?",
+                             (current_hash, func.__name__))
+
+def to_blob(result, blob_type):
+    if blob_type == int:
+        return result
+    if blob_type == np.ndarray:
+        with io.BytesIO() as output:
+            np.save(output, result)
+            return output.getvalue()
+
+def from_blob(blob, blob_type):
+    if blob_type == int:
+        return blob
+    if blob_type == np.ndarray:
+        with io.BytesIO(blob) as input_bytes:
+            return np.load(input_bytes)
+
+
+
+def load_cache_with_hash(func, blob_type):
     """Load the cache from the SQLite database into a dictionary."""
     conn = initialize_db()
-    create_table_if_not_exists(conn, func_name)
+    function_setup(conn, func)
     
     cache = {}
     cursor = conn.cursor()
-    cursor.execute(f"SELECT hash_key, result FROM {func_name}")
+    cursor.execute(f"SELECT hashKey, result FROM {func.__name__}")
     rows = cursor.fetchall()
     
     for row in rows:
-        cache[row[0]] = row[1]
+        cache[row[0]] = from_blob(row[1], blob_type)
     
     conn.close()
-    print(f"Cache loaded: {cache}")
     return cache
 
-def save_cache_with_hash(func, func_name):
+def save_cache_with_hash(func, blob_type):
     """Save the function cache to the SQLite database."""
     conn = initialize_db()
-    create_table_if_not_exists(conn, func_name)
+    function_setup(conn, func)
     
     with conn:
         for hash_key, result in func.cache.items():
             conn.execute(f"""
-                INSERT OR REPLACE INTO {func_name} (hash_key, result)
+                INSERT OR REPLACE INTO {func.__name__} (hashKey, result)
                 VALUES (?, ?)
-            """, (hash_key, result))
+            """, (hash_key, to_blob(result, blob_type)))
     
     conn.close()
 
 
-def cache_with_hash(dictionary_json):
+def cache_with_hash(blob_type):
     def decorator(func):
-        cache = load_cache_with_hash(dictionary_json)
+        cache = load_cache_with_hash(func, blob_type)
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -77,31 +130,51 @@ def cache_with_hash(dictionary_json):
         # Attach the cache to the wrapper so it can be accessed externally
         wrapper.cache = cache
 
-        atexit.register(lambda : save_cache_with_hash(wrapper, dictionary_json))
+        atexit.register(lambda : save_cache_with_hash(wrapper, blob_type))
 
         return wrapper
     return decorator
 
 # Example usage
-@cache_with_hash("add_custom")
+@cache_with_hash(int)
 def add_custom(x, y):
     return x + y
 
-@cache_with_hash("multiply_custom")
+@cache_with_hash(int)
 def multiply_custom(x, y):
     time.sleep(1)
     return x * y
 
 
-def test_main():
+def test_multiply():
     for _ in range(100):
         a = random.randint(1, 5)
         b = random.randint(1, 5)
         result = multiply_custom(a, b)
 
     # Manually save the cache if needed
-    save_cache_with_hash(multiply_custom, "multiply_custom")
+    save_cache_with_hash(multiply_custom, np.ndarray)
 
+@cache_with_hash(np.ndarray)
+def multiply_matrix(a, b):
+    return a @ b
+
+def test_matrix():
+    for _ in range(100):
+        matrix1 = np.random.randint(1, 6, size=(2, 2))
+        # matrix2 = np.random.randint(1, 6, size=(2, 2))
+        
+        # Multiply the matrices
+        result = multiply_matrix(matrix1, matrix1)
+        answer = matrix1 @ matrix1
+        assert np.allclose(result, answer)
+
+
+    save_cache_with_hash(multiply_matrix, np.ndarray)
+
+
+def test_main():
+    test_matrix()
 
 if __name__ == "__main__":
     test_main()
